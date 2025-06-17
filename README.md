@@ -11,6 +11,7 @@ Supports external discovery config integration
 
 📁 **Directory Structure**
 
+```
 msk-migration-cli/
 ├── bin/
 │   └── msk-migration-cli          # Main CLI script
@@ -20,6 +21,7 @@ msk-migration-cli/
 │       ├── variables.tf
 │       └── outputs.tf
 ├── README.md                      # You are here
+```
 
 🚀 **Usage**
 🔧 Command
