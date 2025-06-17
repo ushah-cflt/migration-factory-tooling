@@ -1,0 +1,274 @@
+#!/bin/bash
+
+COMMAND=$1
+shift
+
+if [[ "$COMMAND" == "eks-jump-cluster" ]]; then
+  CREATE=false
+  DESTROY=false
+  FORCE=false
+  FORCE_CLEANUP=false
+  NAME=""
+  REGION=""
+  DESIRED_SIZE=3
+  VPC_ID=""
+  SUBNET_ID=""
+  OUTPUT_FILE=""
+  DISCOVERY_CONFIG=""
+  INSTANCE_TYPE=""
+
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --create) CREATE=true ;;
+      --destroy) DESTROY=true ;;
+      --force) FORCE=true ;;
+      --force-cleanup) FORCE_CLEANUP=true ;;
+      --name) NAME="$2"; shift ;;
+      --aws-account-id) AWS_ACCOUNT_ID="$2"; shift ;;
+      --region) REGION="$2"; shift ;;
+      --desired-size) DESIRED_SIZE="$2"; shift ;;
+      --instance-type) INSTANCE_TYPE="$2"; shift ;;
+      --vpc-id) VPC_ID="$2"; shift ;;
+      --subnet-id) SUBNET_ID="$2"; shift ;;
+      --output-file) OUTPUT_FILE="$2"; shift ;;
+      --discovery-config) DISCOVERY_CONFIG="$2"; shift ;;
+      *) echo "Unknown option $1"; exit 1 ;;
+    esac
+    shift
+  done
+
+  WORKDIR="eks-cluster-$NAME"
+
+  if [[ "$CREATE" == true ]]; then
+    echo "[*] Creating EKS cluster '$NAME' in region '$REGION'..."
+
+    mkdir -p "$WORKDIR"
+    cp -r "$(dirname "$0")/../templates/terraform-eks"/* "$WORKDIR/"
+
+    cat > "$WORKDIR/terraform.tfvars" <<EOF
+cluster_name = "$NAME"
+region = "$REGION"
+vpc_id = "$VPC_ID"
+subnet_ids = [$(echo $SUBNET_ID | sed 's/,/","/g' | sed 's/^/"/;s/$/"/')]
+desired_node_count = "$DESIRED_SIZE"
+instance_type = "$INSTANCE_TYPE"
+aws_account_id = "$AWS_ACCOUNT_ID"
+EOF
+
+    pushd "$WORKDIR" > /dev/null
+    terraform init
+    terraform apply -auto-approve
+
+    terraform output -json > "../$OUTPUT_FILE"
+    popd > /dev/null
+
+    [[ -n "$DISCOVERY_CONFIG" ]] && cp "$DISCOVERY_CONFIG" "$WORKDIR/"
+
+    echo "[✓] Cluster '$NAME' created. Output saved to $OUTPUT_FILE"
+
+  elif [[ "$DESTROY" == true ]]; then
+    if [[ ! -d "$WORKDIR" ]]; then
+      echo "[✗] No existing cluster directory found for '$NAME'. Cannot destroy."
+      exit 1
+    fi
+
+    echo "[*] Destroying EKS cluster '$NAME'..."
+
+    # Optionally confirm destruction if --force not set
+    if [[ "$FORCE" == false ]]; then
+      read -p "Are you sure you want to destroy cluster '$NAME'? [y/N]: " confirm
+      if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Aborting destroy."
+        exit 0
+      fi
+    fi
+
+    pushd "$WORKDIR" > /dev/null
+    terraform destroy -auto-approve
+    popd > /dev/null
+
+    echo "[✓] Cluster '$NAME' destroyed."
+
+    if [[ "$FORCE_CLEANUP" == true ]]; then
+      echo "[*] Cleaning up working directory '$WORKDIR'..."
+      rm -rf "$WORKDIR"
+      echo "[✓] Cleanup complete."
+    fi
+
+  else
+    echo "Specify either --create or --destroy"
+    exit 1
+  fi
+
+
+
+
+
+
+#####
+
+
+elif [[ "$COMMAND" == "cfk-jump-cluster" ]]; then
+  CREATE=false
+  DELETE=false
+  MANIFEST="../templates/cfk-deployment/cfk-cluster.yaml"
+  NAMESPACE="confluent"
+  FORCE=false
+  DISCOVERY_JSON="./discovery.json"
+  CFK_HELM_PACKAGE="../templates/cfk-deployment/confluent-for-kubernetes-3.0.0.tar.gz"
+  MDS_MANIFEST="../templates/cfk-deployment/krc-nodeport.yaml"
+
+
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --create) CREATE=true ;;
+      --delete) DELETE=true ;;
+    #  --manifest) MANIFEST="$2"; shift ;;
+      --namespace) NAMESPACE="$2"; shift ;;
+      --force) FORCE=true ;;
+      --discovery-json) DISCOVERY_JSON="$2"; shift ;;
+      --cfk-package) CFK_HELM_PACKAGE="$2"; shift ;;
+      *) echo "Unknown option $1"; exit 1 ;;
+    esac
+    shift
+  done
+
+
+  # Check for required tools
+  command -v aws >/dev/null 2>&1 || { echo "[✗] 'aws' CLI is not installed."; exit 1; }
+  command -v helm >/dev/null 2>&1 || { echo "[✗] 'helm' is not installed."; exit 1; }
+  [[ "$(helm version --short | grep v3)" ]] || { echo "[✗] Helm v3 is required."; exit 1; }
+
+  # Parse discovery.json
+  if [[ ! -f "$DISCOVERY_JSON" ]]; then
+    echo "[✗] discovery.json not found at $DISCOVERY_JSON"
+    exit 1
+  fi
+
+  KUBECONFIG_CMD=$(jq -r '.kubeconfig_command.value' "$DISCOVERY_JSON")
+  DESIRED_REPLICAS=$(jq -r '.desired_node_count.value' "$DISCOVERY_JSON")
+
+  echo "[*] Setting kubeconfig with: $KUBECONFIG_CMD"
+  eval "$KUBECONFIG_CMD"
+  EKS_CLUSTER_NAME=$(jq -r '.eks_cluster_name.value' "$DISCOVERY_JSON")
+
+  # Create working directory
+    echo "[*] found eks cluster name : $EKS_CLUSTER_NAME"
+    WORKDIR="./cfk-cluster-$EKS_CLUSTER_NAME"
+    echo "[*] setting workdir : $WORKDIR"
+    if [[ "$CREATE" == true ]]; then
+      echo "[*] Creating CFK cluster '$EKS_CLUSTER_NAME' in eks cluster '$EKS_CLUSTER_NAME'..."
+
+      mkdir -p "$WORKDIR"
+      cp -r "$(dirname "$0")/../templates/cfk-deployment"/* "$WORKDIR/"
+
+    echo "[*] Extracting CFK Helm chart package..."
+    tar -xzf "$CFK_HELM_PACKAGE" -C "$WORKDIR" || { echo "[✗] Failed to extract CFK package."; exit 1; }
+
+    # Detect the extracted folder name (assumes only one folder is created)
+    EXTRACTED_DIR=$(tar -tzf "$CFK_HELM_PACKAGE" | head -1 | cut -d/ -f1)
+    CHART_PATH="$WORKDIR/$EXTRACTED_DIR/helm/confluent-for-kubernetes"
+
+    if [[ ! -d "$CHART_PATH" ]]; then
+      echo "[✗] Helm chart directory not found: $CHART_PATH"
+      exit 1
+    fi
+
+    echo "[*] Installing CFK Helm chart from $CHART_PATH..."
+    helm upgrade --install confluent-operator "$CHART_PATH" --namespace "$NAMESPACE" --create-namespace || { echo "[✗] Helm install failed."; exit 1; }
+
+    echo "[✓] CFK Helm chart installed."
+ #   echo "[check] UPDATED_MANIFEST="$WORKDIR/$(basename "$MANIFEST")""
+    UPDATED_MANIFEST="$WORKDIR/$(basename "$MANIFEST")"
+    echo "[*] Updating manifest $UPDATED_MANIFEST"
+
+    cp "$MANIFEST" "$UPDATED_MANIFEST"
+    # updating the namespace
+    echo "[*] Updating Namespace ($NAMESPACE).."
+    sed -i "s/namespace: confluent\+/namespace: $NAMESPACE/g"  "$UPDATED_MANIFEST"
+    echo "[*] Updating manifest with replicas = $DESIRED_REPLICAS"
+    # Update replicas field only under 'kind: Kafka'
+    awk -v replicas="$DESIRED_REPLICAS" '
+      BEGIN { insideKafka = 0 }
+      /^kind: Kafka$/ { insideKafka = 1 }
+      /^kind:/ && $0 !~ /Kafka/ { insideKafka = 0 }
+      insideKafka && /^[[:space:]]+replicas:/ {
+        sub(/[0-9]+/, replicas)
+        insideKafka = 0
+      }
+      { print }
+    ' "$UPDATED_MANIFEST" > "${UPDATED_MANIFEST}.tmp" && mv "${UPDATED_MANIFEST}.tmp" "$UPDATED_MANIFEST"
+
+    echo "[✓] Manifest replicas updated for Kafka kind."
+
+    # Conditionally update replicas for KRaftController only if desired_node_count == 1
+    if [[ "$DESIRED_REPLICAS" -eq 1 ]]; then
+      echo "[*] Updating replicas for KRaftController to 1 (single-node)..."
+      awk '
+        BEGIN { insideKraft = 0 }
+        /^kind: KRaftController$/ { insideKraft = 1 }
+        /^kind:/ && $0 !~ /KRaftController/ { insideKraft = 0 }
+        insideKraft && /^[[:space:]]+replicas:/ {
+          sub(/[0-9]+/, 1)
+          insideKraft = 0
+        }
+        { print }
+      ' "$UPDATED_MANIFEST" > "${UPDATED_MANIFEST}.tmp" && mv "${UPDATED_MANIFEST}.tmp" "$UPDATED_MANIFEST"
+      echo "[✓] KRaftController replicas set to 1."
+    else
+      echo "[*] Skipping KRaftController replica update (desired_node_count > 1)."
+    fi
+
+
+
+    # Getting the one internal IP for External Access
+    NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+    echo "[*] Using node internal IP: $NODE_IP"
+
+
+
+    # Replace external host in manifest with current NODE_IP
+    echo "[*] Updating External HOST IP with NODE Internal IP ($NODE_IP)..."
+    sed -i "s/host: [0-9.]\+/host: $NODE_IP/g" "$UPDATED_MANIFEST"
+    sed -i "s|endpoint: http://[0-9.]\+:|endpoint: http://$NODE_IP:|g" "$UPDATED_MANIFEST"
+    echo "[✓] IP addresses updated in manifest."
+
+    echo "[*] Applying updated manifest to namespace '$NAMESPACE'..."
+    kubectl apply -n "$NAMESPACE" -f "$UPDATED_MANIFEST"
+    kubectl apply -n "$NAMESPACE" -f "$MDS_MANIFEST"
+
+    echo "[✓] Manifest applied successfully."
+
+  elif [[ "$DELETE" == true ]]; then
+    echo "[*] Deleting CFK resources from namespace '$NAMESPACE'..."
+
+    if [[ "$FORCE" == false ]]; then
+      read -p "Are you sure you want to delete CFK cluster in namespace '$NAMESPACE'? [y/N]: " confirm
+      if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Aborting delete."
+        exit 0
+      fi
+    fi
+
+    kubectl delete -n "$NAMESPACE" -f "$UPDATED_MANIFEST"
+    kubectl delete -n "$NAMESPACE" -f "$MDS_MANIFEST"
+    echo "[✓] CFK resources deleted."
+
+    echo "[*] Uninstalling Helm release 'confluent-operator'..."
+    helm uninstall confluent-operator --namespace "$NAMESPACE"
+
+    echo "[✓] Helm release deleted."
+
+    echo "[*] Cleaning up working directory: $WORKDIR"
+    rm -rf "$WORKDIR"
+    echo "[✓] Deleted: $WORKDIR"
+
+  else
+    echo "Specify either --apply or --delete"
+    exit 1
+  fi
+
+else
+  echo "Unknown command: $COMMAND"
+  exit 1
+fi
